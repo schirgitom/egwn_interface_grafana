@@ -1,0 +1,115 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: integration
+      POSTGRES_PASSWORD: integration-tests-only
+      POSTGRES_DB: integration
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U integration"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  grafana:
+    image: grafana/grafana:13.3.0
+    environment:
+      GF_SERVER_ROOT_URL: http://grafana:3000
+      GF_SECURITY_ADMIN_USER: integration
+      GF_SECURITY_ADMIN_PASSWORD: integration-tests-only
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_AUTO_ASSIGN_ORG: "false"
+      GF_AUTH_GENERIC_OAUTH_ENABLED: "true"
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: grafana
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: integration-tests-only
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: http://keycloak:8080/realms/egwn/protocol/openid-connect/auth
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: http://keycloak:8080/realms/egwn/protocol/openid-connect/token
+      GF_AUTH_GENERIC_OAUTH_API_URL: http://keycloak:8080/realms/egwn/protocol/openid-connect/userinfo
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: "'None'"
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_STRICT: "true"
+      GF_AUTH_GENERIC_OAUTH_ORG_ATTRIBUTE_PATH: "[egwn_org]"
+      GF_AUTH_GENERIC_OAUTH_SCOPES: openid profile email
+      GF_AUTH_GENERIC_OAUTH_ALLOW_SIGN_UP: "true"
+      GF_AUTH_GENERIC_OAUTH_USE_PKCE: "true"
+      GF_AUTH_GENERIC_OAUTH_ALLOW_ASSIGN_GRAFANA_ADMIN: "false"
+      GF_AUTH_GENERIC_OAUTH_SKIP_ORG_ROLE_SYNC: "false"
+      GF_LOG_LEVEL: warn
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/api/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+  rabbitmq:
+    image: rabbitmq:4.2-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: integration
+      RABBITMQ_DEFAULT_PASS: integration-tests-only
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+  keycloak-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: integration-tests-only
+      POSTGRES_DB: keycloak
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  keycloak:
+    image: egwn-keycloak:26.8.2
+    build:
+      context: ./keycloak
+    command: ["start-dev"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: integration-tests-only
+      KC_BOOTSTRAP_ADMIN_USERNAME: integration
+      KC_BOOTSTRAP_ADMIN_PASSWORD: integration-tests-only
+      KC_HOSTNAME: http://keycloak:8080
+      EGWN_BACKEND_URL: http://api:8080
+      EGWN_INTERNAL_TOKEN: integration-internal-token-01234567890123456789
+      EGWN_ALLOW_INSECURE_HTTP: "true"
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+  api:
+    image: egwn-grafana:integration
+    build:
+      context: .
+    environment: &api-environment
+      ConnectionStrings__Service: Host=postgres;Database=integration;Username=integration;Password=integration-tests-only
+      Grafana__BaseUrl: http://grafana:3000
+      Grafana__AdminUser: integration
+      Grafana__AdminPassword: integration-tests-only
+      Keycloak__BaseUrl: http://keycloak:8080
+      Keycloak__Realm: egwn
+      Keycloak__ClientId: egwn-provisioner
+      Keycloak__ClientSecret: integration-tests-only
+      Registration__InternalToken: integration-internal-token-01234567890123456789
+      Registration__HashKey: integration-hash-key-0123456789012345678901234
+      RabbitMQ__Enabled: "true"
+      RabbitMQ__HostName: rabbitmq
+      RabbitMQ__UserName: integration
+      RabbitMQ__Password: integration-tests-only
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+  migrate:
+    image: egwn-grafana:integration
+    environment: *api-environment
+    command: ["--migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
