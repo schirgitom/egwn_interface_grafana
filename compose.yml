@@ -95,6 +95,11 @@ services:
       Grafana__BaseUrl: http://grafana:3000
       Grafana__AdminUser: ${GRAFANA_ADMIN_USER:-provisioner}
       Grafana__AdminPassword: ${GRAFANA_ADMIN_PASSWORD}
+      Measurement__Enabled: ${MEASUREMENT_ENABLED:-false}
+      Measurement__ProvisioningConnectionString: ${PERSISTENCE_PROVISIONING_CONNECTION:-}
+      Measurement__GrafanaDatabaseHost: ${PERSISTENCE_DB_HOST:-egwn-timescaledb}
+      Measurement__GrafanaDatabasePort: ${PERSISTENCE_DB_PORT:-5432}
+      Measurement__CredentialKey: ${MEASUREMENT_CREDENTIAL_KEY:-}
       Keycloak__BaseUrl: https://${KEYCLOAK_DOMAIN}
       Keycloak__Realm: egwn
       Keycloak__ClientId: egwn-provisioner

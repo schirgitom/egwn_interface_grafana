@@ -24,6 +24,15 @@ public sealed class GrafanaOptions
     public string AdminPassword { get; set; } = "";
 }
 
+public sealed class MeasurementOptions
+{
+    public bool Enabled { get; set; }
+    public string ProvisioningConnectionString { get; set; } = "";
+    public string GrafanaDatabaseHost { get; set; } = "";
+    public int GrafanaDatabasePort { get; set; } = 5432;
+    public string CredentialKey { get; set; } = "";
+}
+
 public sealed class IdentityOptions
 {
     public string BaseUrl { get; set; } = "";

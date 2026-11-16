@@ -29,6 +29,148 @@ public sealed class IntegrationFactAttribute : FactAttribute
 public sealed class IntegrationTests
 {
     [IntegrationFact]
+    public async Task CustomerDataSourceExposesOwnMetersAndOnlyCommunityAggregates()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var initial = PolicyTests.Message();
+        var original = initial with { Customer = initial.Customer with
+        { CustomerNumber = "K" + Guid.NewGuid().ToString("N")[..12] } };
+        var customer = original.Customer;
+        var ownCode = customer.MeteringPoints![0].MeteringPointCode;
+        var community = customer.EnergyCommunities![0].SourceId!;
+        var otherCode = "AT999999999999999999999999999999";
+        await fixture.Db.Database.ExecuteSqlRawAsync("""
+            CREATE TABLE public.meter_points ("Id" bigint PRIMARY KEY, meter_point_number text, energy_direction text);
+            CREATE TABLE public.meter_point_communities (meter_id bigint, community_id text);
+            CREATE TABLE public.raw_measurements (meter_id bigint, community_id text, timestamp timestamptz,
+                total_consumption numeric, grid_share numeric, community_share numeric);
+            CREATE TABLE public.kpi_measurements (community_id text, timestamp timestamptz, autarky numeric,
+                own_consumption numeric, community numeric, feed numeric, remaining_demand numeric);
+            """);
+        await fixture.Db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO public.meter_points VALUES (1, {ownCode}, 'consumption'),
+                (2, {otherCode}, 'generation'), (3, 'AT000003', 'generation'),
+                (4, 'AT000004', 'generation');
+            INSERT INTO public.meter_point_communities VALUES (1, {community}), (2, {community}),
+                (3, {community}), (4, {community}), (2, 'foreign');
+            INSERT INTO public.raw_measurements VALUES
+              (1, {community}, NOW(), 10, 4, 6), (2, {community}, NOW(), 20, 8, 12),
+              (3, {community}, NOW(), 30, 12, 18), (4, {community}, NOW(), 40, 16, 24),
+              (2, 'foreign', NOW(), 99, 99, 0);
+            INSERT INTO public.kpi_measurements VALUES ({community}, NOW(), 0, 0, 0, 0, 0);
+            """);
+        var source = new TenantMeasurementProvisioner(Options.Create(new MeasurementOptions
+        {
+            Enabled = true, ProvisioningConnectionString = fixture.ConnectionString,
+            GrafanaDatabaseHost = "postgres", CredentialKey = new string('s', 48)
+        }));
+        var provisioner = new GrafanaProvisioner(fixture.Grafana, Options.Create(new GrafanaOptions
+        { AdminUser = "integration", AdminPassword = "integration-tests-only" }), fixture.Db, source);
+        try
+        {
+            await new EventProcessor(fixture.Db, provisioner, fixture.Identities,
+                fixture.Secrets, TimeProvider.System, NullLogger<EventProcessor>.Instance)
+                .ProcessAsync(original, default);
+            var orgId = (await fixture.Db.Customers.AsNoTracking().SingleAsync()).OrganizationId!.Value;
+            var tenant = await source.ReconcileAsync(customer, default);
+            await source.EnableAsync(customer.CustomerNumber, customer.Id, default);
+            var reader = new NpgsqlConnectionStringBuilder(fixture.ConnectionString)
+            { Username = tenant.User, Password = tenant.Password, Pooling = false };
+            await using var connection = new NpgsqlConnection(reader.ConnectionString);
+            await connection.OpenAsync();
+            async Task<long> CountAsync(string sql)
+            {
+                await using var command = new NpgsqlCommand(sql, connection);
+                return (long)(await command.ExecuteScalarAsync())!;
+            }
+            Assert.Equal(1, await CountAsync($"SELECT count(*) FROM {tenant.Schema}.raw_measurements"));
+            Assert.Equal(1, await CountAsync($"SELECT count(*) FROM {tenant.Schema}.meter_points"));
+            Assert.Equal(1, await CountAsync($"SELECT count(*) FROM {tenant.Schema}.meter_point_communities"));
+            Assert.Equal(1, await CountAsync($"SELECT count(*) FROM {tenant.Schema}.kpi_measurements"));
+            Assert.Equal(1, await CountAsync($"SELECT count(*) FROM {tenant.Schema}.community_totals"));
+            Assert.Equal(90, await CountAsync($"SELECT total::bigint FROM {tenant.Schema}.community_totals"));
+            Assert.Equal(0, await CountAsync(
+                $"SELECT count(*) FROM {tenant.Schema}.community_totals WHERE energy_direction='consumption'"));
+            await Assert.ThrowsAsync<PostgresException>(() => CountAsync("SELECT count(*) FROM public.raw_measurements"));
+            var dashboards = GrafanaProvisioner.BuildDashboards(customer, tenant);
+            var generationMeter = customer.MeteringPoints[0] with { EnergyDirection = "generation" };
+            var generationCommunity = customer.EnergyCommunities[0] with
+            {
+                MeteringPoints = [customer.EnergyCommunities[0].MeteringPoints[0] with
+                { EnergyDirection = "generation" }]
+            };
+            var generationDashboards = GrafanaProvisioner.BuildDashboards(customer with
+            {
+                MeteringPoints = [generationMeter], EnergyCommunities = [generationCommunity]
+            }, tenant);
+            Assert.Contains("Erzeugung", generationDashboards.Single(d =>
+                d["title"]!.GetValue<string>().StartsWith("Meter -"))["panels"]!.ToJsonString());
+            Assert.Contains("rawSql", dashboards.Single(d => d["title"]!.GetValue<string>().StartsWith("Meter -")).ToJsonString());
+            Assert.Equal(3, dashboards.Count);
+            Assert.DoesNotContain(tenant.Password, JsonSerializer.Serialize(dashboards));
+            using var request = new HttpRequestMessage(HttpMethod.Get,
+                $"api/datasources/uid/{ResourceIdentity.Dashboard(customer.Id, "datasource", customer.Id)}");
+            request.Headers.Add("X-Grafana-Org-Id", orgId.ToString());
+            using var response = await fixture.Grafana.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+            var dataSource = await response.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.Equal(orgId, dataSource.GetProperty("orgId").GetInt64());
+            var targets = dashboards.SelectMany(d => d["panels"]!.AsArray())
+                .Where(p => p!["type"]!.GetValue<string>() != "text")
+                .Select((p, index) => new
+                {
+                    refId = $"Q{index}", datasource = new { uid = dataSource.GetProperty("uid").GetString() },
+                    rawSql = p!["targets"]![0]!["rawSql"]!.GetValue<string>(),
+                    format = p["targets"]![0]!["format"]!.GetValue<string>(), rawQuery = true,
+                    editorMode = "code", intervalMs = 3600000, maxDataPoints = 100
+                }).ToArray();
+            Assert.Equal(9, targets.Length);
+            using var query = new HttpRequestMessage(HttpMethod.Post, "api/ds/query");
+            query.Headers.Add("X-Grafana-Org-Id", orgId.ToString());
+            query.Content = JsonContent.Create(new
+            {
+                from = DateTimeOffset.UtcNow.AddDays(-1).ToUnixTimeMilliseconds().ToString(),
+                to = DateTimeOffset.UtcNow.AddDays(1).ToUnixTimeMilliseconds().ToString(),
+                queries = targets
+            });
+            using var queryResult = await fixture.Grafana.SendAsync(query);
+            queryResult.EnsureSuccessStatusCode();
+            var result = await queryResult.Content.ReadFromJsonAsync<JsonElement>();
+            foreach (var target in targets)
+            {
+                var entry = result.GetProperty("results").GetProperty(target.refId);
+                Assert.False(entry.TryGetProperty("error", out var error), error.ToString());
+                Assert.NotEmpty(entry.GetProperty("frames").EnumerateArray());
+            }
+            await Assert.ThrowsAsync<InvalidEventException>(() => source.ReconcileAsync(customer with
+            {
+                EnergyCommunities = [customer.EnergyCommunities[0] with { SourceId = "" }]
+            }, default));
+            await Assert.ThrowsAsync<PostgresException>(() => CountAsync($"SELECT count(*) FROM {tenant.Schema}.raw_measurements"));
+            await connection.CloseAsync();
+            await source.ReconcileAsync(customer with
+            {
+                MeteringPoints = [],
+                EnergyCommunities = [customer.EnergyCommunities[0] with { MeteringPoints = [] }]
+            }, default);
+            await using (var blocked = new NpgsqlConnection(reader.ConnectionString))
+                await Assert.ThrowsAsync<PostgresException>(() => blocked.OpenAsync());
+            await source.EnableAsync(customer.CustomerNumber, customer.Id, default);
+            await connection.OpenAsync();
+            Assert.Equal(0, await CountAsync($"SELECT count(*) FROM {tenant.Schema}.raw_measurements"));
+            await source.DeleteAsync(customer.CustomerNumber, customer.Id, default);
+            await Assert.ThrowsAsync<PostgresException>(() => CountAsync($"SELECT count(*) FROM {tenant.Schema}.raw_measurements"));
+            await connection.CloseAsync();
+            await using (var blocked = new NpgsqlConnection(reader.ConnectionString))
+                await Assert.ThrowsAsync<PostgresException>(() => blocked.OpenAsync());
+        }
+        finally
+        {
+            await provisioner.DeleteAsync(customer.Id, null, default);
+        }
+    }
+
+    [IntegrationFact]
     public async Task ReconcilesRealGrafanaAndPostgresWithRegistrationLifecycle()
     {
         await using var fixture = await Fixture.CreateAsync();

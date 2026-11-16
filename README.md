@@ -8,7 +8,7 @@
 - Customer updates replace the managed snapshot. Removed associations remove obsolete managed dashboards; customer deletion removes the managed organization.
 - A common Keycloak realm; each user belongs to exactly one customer and receives Viewer access only.
 - Reusable `registrationCode`: multiple users can register until the code is rotated or the customer deleted. Rotation preserves existing memberships.
-- **Measurement access is intentionally disabled.** Dashboards contain metadata and navigation, not SQL queries or data sources. Supply TimescaleDB table definitions and meter-ID mappings before implementing measurement access.
+- Measurement provisioning is opt-in. Until enabled, dashboards contain metadata and navigation, not SQL queries. With it enabled, each organization has its own PostgreSQL datasource and restricted measurement dashboards.
 - The CentralAPI is a separate project and is not modified here.
 
 ## Projects
@@ -75,7 +75,15 @@ Grafana persists SSO settings in its database, overriding file/environment defau
 
 Customer deletion removes the Grafana organization, removes the managed Keycloak attribute and logs out affected Keycloak sessions. Other realm users are not deleted. Failed cleanup remains pending and retryable. Registration-code rotation does not revoke existing memberships. Per-user removal and account recovery/reassignment are administrative workflows outside this first implementation.
 
-**Viewer is not a database isolation boundary.** Before enabling measurement data sources, enforce tenant access in PostgreSQL (for example dedicated tenant roles/views with carefully designed grants). Dashboard filters and a common unrestricted SQL credential are insufficient. Include shared metering points and connection pooling in that design.
+**Viewer is not a database isolation boundary.** Measurement access uses one PostgreSQL login and owned schema per customer, based on their immutable `customerNumber`. Only the customer's own `(community_id, meter_point_number)` pairs appear in raw measurement views; community totals and KPIs cover their authorized communities. A community total for a direction/hour is suppressed unless at least three *foreign* meters reported values for that hour. This reduces trivial inference by subtracting one's own data; it is not a formal differential-privacy guarantee. Neither the login nor Grafana receives SELECT on unrestricted Persistence tables. Public grants on TimescaleDB extension-owned metadata are excluded from the privilege check; non-extension tables and rollups, including Timescale-managed customer data, are still checked. Check inherited and PUBLIC grants before rollout.
+
+### Measurement data source (opt-in)
+
+The Persistence database (`egwndata2` on the current live test server) must have `public.meter_points("Id", meter_point_number, energy_direction)`, `public.meter_point_communities(meter_id, community_id)`, `public.raw_measurements(meter_id, community_id, timestamp, total_consumption, grid_share, community_share)` and `public.kpi_measurements(community_id, timestamp, autarky, own_consumption, community, feed, remaining_demand)`. `energy_direction` must contain `consumption`/`generation`; it identifies directions of other community participants for aggregate dashboards. Directions of the customer's own meters come from `energyDirection` in the RabbitMQ snapshot, with the same values. **The service does not migrate the Persistence database.** It uses `customer.energyCommunities[].sourceId` as the external `community_id`, and only meter IDs/codes also present in `customer.meteringPoints` count as customer-owned. A missing/duplicate `sourceId`, inconsistent ownership or unsupported direction rejects provisioning. Existing customer numbers must be unique, immutable and consist of at most 30 ASCII letters, numbers, `_` or `-` (starting with a letter/number); `-` becomes `_`. Collisions are rejected using schema ownership metadata.
+
+Set `MEASUREMENT_ENABLED=true`, `PERSISTENCE_PROVISIONING_CONNECTION` (a dedicated PostgreSQL provisioning account able to create roles/schemas/views and terminate its own tenant sessions), `PERSISTENCE_DB_HOST=egwn-timescaledb`, `PERSISTENCE_DB_PORT=5432` and a distinct random `MEASUREMENT_CREDENTIAL_KEY` of at least 32 characters in the deployment's secret manager. The provisioning connection string must target the actual Persistence database (`egwndata2` for the current live test) **over the private Docker network**, not the server's public IP. Grafana must share that network. `Measurement__*` keys may instead be injected directly as environment variables. Do not put database credentials in RabbitMQ messages or commit them to `.env`. The credential key deterministically derives individual database passwords; protect and back it up. Rotating it requires reconciling all customer data sources and roles.
+
+On each event the service disables the tenant login, terminates pooled connections, atomically refreshes scoped views, checks for PUBLIC or inherited access to other tables, creates/updates the Grafana datasource, imports the customer's overview and per-meter and per-community dashboards, then re-enables the login. Meter dashboards show consumption or generation totals, grid and community shares, and time series for each associated community; community dashboards show direction-specific totals and time series. If provisioning fails, the customer remains not ready and the tenant login remains disabled until retry. Deletion disables the login and terminates pooled connections before removing the Grafana organization, schema and role; retries tolerate an already removed tenant. The login owns neither schema nor views and receives only USAGE on its schema and SELECT on its views. Aggregates expose only `community_id`, hour, direction and totals; no individual foreign meter identifiers. No separate CentralAPI data source is used: customer metadata comes from the RabbitMQ snapshot. For a first rollout, use a test customer and verify the actual network, sourceId mapping, grants and data source connectivity before onboarding others.
 
 ## Configuration and deployment
 
@@ -102,6 +110,7 @@ Important configuration keys:
 | `ConnectionStrings` | `Service` |
 | `RabbitMQ` | `Enabled`, `HostName`, `Port`, `VirtualHost`, `UserName`, `Password`, `UseTls`, `Exchange`, `RoutingKey`, `Queue`, `MaxAttempts`, `RetrySeconds`, `MaxMessageBytes` |
 | `Grafana` | `BaseUrl`, `AdminUser`, `AdminPassword` |
+| `Measurement` | `Enabled`, `ProvisioningConnectionString`, `GrafanaDatabaseHost`, `GrafanaDatabasePort`, `CredentialKey` |
 | `Keycloak` | `BaseUrl`, `Realm`, `ClientId`, `ClientSecret` |
 | `Registration` | `InternalToken`, `HashKey` (distinct secrets, at least 32 characters) |
 | `Consul` | `Enabled`, `Address`, `Key`, optional ACL `Token` |
@@ -138,6 +147,19 @@ docker run --rm --network egwn-grafana-tests_default --env EGWN_INTEGRATION=true
 ```
 
 Keep the API consumer stopped during these tests; each test owns a separate database but they share the disposable Grafana instance. Test locks intentionally do not coordinate across different databases. The RabbitMQ consumer test uses a separate exchange/routing key.
+
+For an explicitly requested live smoke test against the **already running** `egwn-timescaledb`, `egwn-rabbitmq` and `egwn-grafana` containers, use `LiveEnvironmentTests.ProvisionsRealMeasurementsThroughRabbitMqAndCleansUp`. Supply `EGWN_LIVE_PROVISIONING_CONNECTION` (private-network connection to the Persistence database), `EGWN_LIVE_GRAFANA_USER`, `EGWN_LIVE_GRAFANA_PASSWORD`, `EGWN_LIVE_GRAFANA_HOST`, `EGWN_LIVE_RABBIT_USER`, `EGWN_LIVE_RABBIT_PASSWORD` and `EGWN_LIVE_RABBIT_HOST` securely in the shell environment, then run:
+
+```powershell
+docker run --rm --network egwn_egwn-network --env EGWN_LIVE_INTEGRATION=true `
+  --env EGWN_LIVE_PROVISIONING_CONNECTION --env EGWN_LIVE_GRAFANA_USER --env EGWN_LIVE_GRAFANA_PASSWORD `
+  --env EGWN_LIVE_GRAFANA_HOST --env EGWN_LIVE_RABBIT_USER --env EGWN_LIVE_RABBIT_PASSWORD `
+  --env EGWN_LIVE_RABBIT_HOST --mount "type=bind,source=$($PWD.Path),target=/work" -w /work `
+  mcr.microsoft.com/dotnet/sdk:10.0 dotnet test .\tests\EGWNInterfaceGrafana.Tests\EGWNInterfaceGrafana.Tests.csproj `
+  --filter FullyQualifiedName~LiveEnvironmentTests.ProvisionsRealMeasurementsThroughRabbitMqAndCleansUp
+```
+
+This opt-in test uses an existing real meter/community reading in `egwndata2` without modifying source measurements. It publishes a synthetic customer snapshot through its **own** RabbitMQ exchange and queue, creates a disposable service-state database, tenant schema/role and Grafana organization, verifies the datasource and all nine generated panel queries (including a nonempty meter time series), then removes those test resources and restores the previous SSO mapping. It requires a working Grafana server-admin account, PostgreSQL create-database/role/schema and backend-termination privileges, and a populated `meter_points.energy_direction` with `consumption`/`generation`. Do not run it during a migration or concurrently with other Grafana SSO provisioning. It does not create, restart or remove the existing service containers; a failure during cleanup must be investigated before re-running. Never put the credentials in a committed file or the command line.
 
 Browser tests under `tests\browser` exercise two registrations using the same code, actual Grafana Viewer membership, cross-customer denial, code rotation and customer deletion. They require the full integration Compose stack plus the configured Keycloak realm. Build that image and run it on the integration network after setup:
 

@@ -41,6 +41,8 @@ public sealed class EventProcessor(
                         throw new InvalidEventException("A deleted customer ID cannot be reused.");
                     var previous = desired is null ? null :
                         JsonSerializer.Deserialize<CustomerSnapshot>(desired.SnapshotJson, EventPolicy.Json);
+                    if (previous is not null && previous.CustomerNumber != incoming.CustomerNumber)
+                        throw new InvalidEventException("Customer number is immutable.");
                     if (desired is null)
                     {
                         desired = new CustomerState { Id = incoming.Id };

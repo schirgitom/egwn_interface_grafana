@@ -23,6 +23,11 @@ builder.Services.AddOptions<RabbitOptions>().BindConfiguration("RabbitMQ")
 builder.Services.AddOptions<GrafanaOptions>().BindConfiguration("Grafana")
     .Validate(o => ValidUrl(o.BaseUrl) && o.AdminUser.Length > 0 && o.AdminPassword.Length > 0,
         "Grafana URL and administrative credentials required.").ValidateOnStart();
+builder.Services.AddOptions<MeasurementOptions>().BindConfiguration("Measurement")
+    .Validate(o => !o.Enabled || (o.ProvisioningConnectionString.Length > 0 &&
+        o.GrafanaDatabaseHost.Length > 0 && o.GrafanaDatabasePort is > 0 and <= 65535 &&
+        o.CredentialKey.Length >= 32), "Measurement database connection, Grafana host and independent credential key required.")
+    .ValidateOnStart();
 builder.Services.AddOptions<IdentityOptions>().BindConfiguration("Keycloak")
     .Validate(o => ValidUrl(o.BaseUrl) && o.Realm.Length > 0 && o.ClientId.Length > 0 && o.ClientSecret.Length > 0,
         "Keycloak URL, realm and provisioning client credentials required.").ValidateOnStart();
@@ -37,6 +42,7 @@ builder.Services.AddSingleton<RegistrationSecrets>();
 builder.Services.AddSingleton<RabbitStatus>();
 builder.Services.AddScoped<EventProcessor>();
 builder.Services.AddScoped<RegistrationService>();
+builder.Services.AddScoped<TenantMeasurementProvisioner>();
 builder.Services.AddHttpClient<IGrafanaProvisioner, GrafanaProvisioner>(client =>
 {
     client.BaseAddress = new Uri(builder.Configuration["Grafana:BaseUrl"]!.TrimEnd('/') + "/");
