@@ -27,10 +27,11 @@ public sealed class GrafanaOptions
 public sealed class MeasurementOptions
 {
     public bool Enabled { get; set; }
-    public string ProvisioningConnectionString { get; set; } = "";
+    public string ApiBaseUrl { get; set; } = "https://egwnpersistence-worker:8443";
+    public string ServiceToken { get; set; } = "";
     public string GrafanaDatabaseHost { get; set; } = "";
     public int GrafanaDatabasePort { get; set; } = 5432;
-    public string CredentialKey { get; set; } = "";
+    public string GrafanaDatabaseName { get; set; } = "";
 }
 
 public sealed class IdentityOptions

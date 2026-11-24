@@ -15,6 +15,9 @@ public static class EventPolicy
         try { message = JsonSerializer.Deserialize<CustomerEvent>(body, Json); }
         catch (JsonException) { throw new InvalidEventException("Invalid event JSON."); }
         if (message is null) throw new InvalidEventException("Missing event.");
+        if (message.Customer is { } customer)
+            message = message with { Customer = customer with { RegistrationCode = null } };
+        message = message with { OccurredAtUtc = message.OccurredAtUtc.ToUniversalTime() };
         Validate(message);
         return message;
     }

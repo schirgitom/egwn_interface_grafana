@@ -10,6 +10,32 @@ namespace EGWNInterfaceGrafana.Tests;
 
 public sealed class PolicyTests
 {
+    internal const string OriginalCustomerEventJson = """{"eventId":"55e7fc4a-29fe-0ec5-3a0a-821deb2211a3","eventType":"customer.created","schemaVersion":1,"occurredAtUtc":"2026-10-09T02:00:00+02:00","customer":{"id":"55e7fc4a-29fe-0ec5-3a0a-821deb2211a3","customerNumber":"232","name":"Wiener Johann","email":null,"isDeleted":false,"meteringPoints":[{"id":"9ef69a17-ccb3-b090-9b75-5a30868c7425","meteringPointCode":"AT0080000816000000202204040112246","energyDirection":"generation","description":null},{"id":"a447d97e-c1a4-d94e-24e9-c17a66f9a006","meteringPointCode":"AT0082000816000000000000000889401","energyDirection":"consumption","description":null}],"energyCommunities":[{"id":"dc200a26-2dba-21c5-6bba-304b2a03df75","name":"EEG TW","source":null,"sourceId":"RC101900","meteringPoints":[{"id":"9ef69a17-ccb3-b090-9b75-5a30868c7425","meteringPointCode":"AT0080000816000000202204040112246","energyDirection":"generation","description":null,"participationPercentage":100.0},{"id":"a447d97e-c1a4-d94e-24e9-c17a66f9a006","meteringPointCode":"AT0082000816000000000000000889401","energyDirection":"consumption","description":null,"participationPercentage":100.0}]}]}}""";
+
+    [Fact]
+    public void OriginalRabbitMqJsonBuildsMetadataDashboardsWithoutLiveServices()
+    {
+        var message = EventPolicy.Parse(Encoding.UTF8.GetBytes(OriginalCustomerEventJson));
+        Assert.Equal(Guid.Parse("55e7fc4a-29fe-0ec5-3a0a-821deb2211a3"), message.EventId);
+        Assert.Equal(DateTimeOffset.Parse("2026-10-09T00:00:00+00:00"), message.OccurredAtUtc);
+        Assert.Equal("232", message.Customer.CustomerNumber);
+        Assert.Equal(new[] { "generation", "consumption" },
+            message.Customer.MeteringPoints!.Select(p => p.EnergyDirection));
+        Assert.Equal("RC101900", message.Customer.EnergyCommunities![0].SourceId);
+        Assert.Equal(message.Customer.MeteringPoints!.Select(p => p.MeteringPointCode),
+            message.Customer.EnergyCommunities[0].MeteringPoints.Select(p => p.MeteringPointCode));
+
+        var dashboards = GrafanaProvisioner.BuildDashboards(message.Customer);
+        Assert.Equal(3, dashboards.Count);
+        Assert.Contains(dashboards, dashboard => dashboard["title"]!.GetValue<string>()
+            .StartsWith("Zählpunkt · Bezug", StringComparison.Ordinal));
+        Assert.Contains(dashboards, dashboard => dashboard["title"]!.GetValue<string>()
+            .StartsWith("Zählpunkt · Erzeugung", StringComparison.Ordinal));
+        Assert.Contains(dashboards, dashboard => dashboard["title"]!.GetValue<string>()
+            .StartsWith("Energiegemeinschaft · Übersicht", StringComparison.Ordinal));
+        Assert.DoesNotContain("rawSql", JsonSerializer.Serialize(dashboards));
+    }
+
     [Theory]
     [InlineData("customer.created")]
     [InlineData("customer.updated")]
@@ -30,6 +56,18 @@ public sealed class PolicyTests
         var message = Message();
         Assert.Throws<InvalidEventException>(() => EventPolicy.Validate(message with
         { Customer = message.Customer with { RegistrationCode = "K-100" } }));
+    }
+
+    [Fact]
+    public void RabbitMqPayloadIgnoresCentralApiRegistrationCode()
+    {
+        var json = OriginalCustomerEventJson.Replace("\"email\":null",
+            "\"email\":null,\"registrationCode\":\"K-100\"", StringComparison.Ordinal);
+        var parsed = EventPolicy.Parse(Encoding.UTF8.GetBytes(json));
+        Assert.Null(parsed.Customer.RegistrationCode);
+        Assert.Equal("232", parsed.Customer.CustomerNumber);
+        Assert.Equal("RC101900", parsed.Customer.EnergyCommunities![0].SourceId);
+        Assert.DoesNotContain("K-100", JsonSerializer.Serialize(parsed, EventPolicy.Json));
     }
 
     [Fact]
@@ -74,11 +112,25 @@ public sealed class PolicyTests
     }
 
     [Fact]
+    public void OrganizationDisplayNameChangesWithoutChangingClaimIdentity()
+    {
+        var customer = Message().Customer;
+        var renamed = customer with { Name = "Updated" };
+        Assert.Equal($"{customer.CustomerNumber} - {customer.Name}", ResourceIdentity.OrganizationName(customer));
+        Assert.Equal($"{customer.CustomerNumber} - Updated", ResourceIdentity.OrganizationName(renamed));
+        Assert.Equal(ResourceIdentity.Organization(customer.Id), ResourceIdentity.Organization(renamed.Id));
+    }
+
+    [Fact]
     public void DashboardsContainNoDataSourceOrQueriesOrCode()
     {
         var customer = Message().Customer;
         var dashboards = GrafanaProvisioner.BuildDashboards(customer);
-        Assert.Equal(3, dashboards.Count);
+        Assert.Equal(2, dashboards.Count);
+        Assert.All(dashboards, dashboard => Assert.DoesNotContain("Customer overview", dashboard.ToJsonString()));
+        Assert.StartsWith("Energiegemeinschaft · Übersicht",
+            dashboards.Single(d => d["title"]!.GetValue<string>().StartsWith("Energiegemeinschaft"))
+                ["title"]!.GetValue<string>());
         var json = JsonSerializer.Serialize(dashboards);
         Assert.DoesNotContain("datasource", json);
         Assert.DoesNotContain("rawSql", json);

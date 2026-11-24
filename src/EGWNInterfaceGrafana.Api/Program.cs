@@ -24,9 +24,9 @@ builder.Services.AddOptions<GrafanaOptions>().BindConfiguration("Grafana")
     .Validate(o => ValidUrl(o.BaseUrl) && o.AdminUser.Length > 0 && o.AdminPassword.Length > 0,
         "Grafana URL and administrative credentials required.").ValidateOnStart();
 builder.Services.AddOptions<MeasurementOptions>().BindConfiguration("Measurement")
-    .Validate(o => !o.Enabled || (o.ProvisioningConnectionString.Length > 0 &&
+    .Validate(o => !o.Enabled || (ValidHttpsUrl(o.ApiBaseUrl) && o.ServiceToken.Length >= 32 &&
         o.GrafanaDatabaseHost.Length > 0 && o.GrafanaDatabasePort is > 0 and <= 65535 &&
-        o.CredentialKey.Length >= 32), "Measurement database connection, Grafana host and independent credential key required.")
+        o.GrafanaDatabaseName.Length > 0), "Persistence HTTPS API, service token and Grafana database address required.")
     .ValidateOnStart();
 builder.Services.AddOptions<IdentityOptions>().BindConfiguration("Keycloak")
     .Validate(o => ValidUrl(o.BaseUrl) && o.Realm.Length > 0 && o.ClientId.Length > 0 && o.ClientSecret.Length > 0,
@@ -34,15 +34,20 @@ builder.Services.AddOptions<IdentityOptions>().BindConfiguration("Keycloak")
 builder.Services.AddOptions<RegistrationOptions>().BindConfiguration("Registration")
     .Validate(o => o.HashKey.Length >= 32 && o.InternalToken.Length >= 32 && o.HashKey != o.InternalToken,
         "Distinct registration hash key and internal token of at least 32 characters required.").ValidateOnStart();
-var connectionString = builder.Configuration.GetConnectionString("Service")
-    ?? throw new InvalidOperationException("ConnectionStrings:Service required.");
+var connectionString = builder.Configuration.GetConnectionString("Service");
+if (string.IsNullOrWhiteSpace(connectionString))
+    throw new InvalidOperationException("ConnectionStrings:Service required.");
 builder.Services.AddDbContext<ServiceDbContext>(o => o.UseNpgsql(connectionString));
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<RegistrationSecrets>();
 builder.Services.AddSingleton<RabbitStatus>();
 builder.Services.AddScoped<EventProcessor>();
 builder.Services.AddScoped<RegistrationService>();
-builder.Services.AddScoped<TenantMeasurementProvisioner>();
+builder.Services.AddHttpClient<TenantMeasurementProvisioner>(client =>
+{
+    client.BaseAddress = new Uri(builder.Configuration["Measurement:ApiBaseUrl"]!.TrimEnd('/') + "/");
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
 builder.Services.AddHttpClient<IGrafanaProvisioner, GrafanaProvisioner>(client =>
 {
     client.BaseAddress = new Uri(builder.Configuration["Grafana:BaseUrl"]!.TrimEnd('/') + "/");
@@ -63,6 +68,7 @@ builder.Services.AddRateLimiter(o =>
 });
 builder.Services.AddHealthChecks();
 builder.Services.AddProblemDetails();
+builder.Services.AddControllers();
 var app = builder.Build();
 
 if (args.Contains("--migrate", StringComparer.Ordinal))
@@ -88,6 +94,7 @@ app.Use(async (context, next) =>
     await next(context);
 });
 app.UseRateLimiter();
+app.MapControllers();
 app.MapHealthChecks("/health/live");
 app.MapGet("/health/ready", async (ServiceDbContext db, RabbitStatus broker, CancellationToken ct) =>
 {
@@ -118,6 +125,9 @@ await app.RunAsync();
 
 static bool ValidUrl(string value) =>
     Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https";
+
+static bool ValidHttpsUrl(string value) =>
+    Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme == "https";
 
 static async Task<IResult> RegistrationResult<T>(Func<Task<T>> action, Microsoft.Extensions.Logging.ILogger logger)
 {

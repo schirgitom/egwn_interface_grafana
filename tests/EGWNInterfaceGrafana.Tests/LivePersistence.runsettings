@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <RunConfiguration>
+    <EnvironmentVariables>
+      <EGWN_LIVE_PERSISTENCE>true</EGWN_LIVE_PERSISTENCE>
+      <EGWN_LIVE_KEEP_RESOURCES>true</EGWN_LIVE_KEEP_RESOURCES>
+    </EnvironmentVariables>
+  </RunConfiguration>
+</RunSettings>

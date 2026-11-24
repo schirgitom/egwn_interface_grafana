@@ -18,13 +18,14 @@ public sealed class GrafanaProvisioner(
     {
         var source = measurements is { Enabled: true }
             ? await measurements.ReconcileAsync(customer, ct) : null;
-        var orgId = await FindOrganizationAsync(customer.Id, ct);
+        var orgId = await FindOrganizationAsync(customer.Id, organizationId,
+            ResourceIdentity.OrganizationName(customer), ct);
         if (orgId is null)
         {
             using var created = await SendAsync(HttpMethod.Post, "api/orgs", null,
                 new { name = ResourceIdentity.Organization(customer.Id) }, ct, HttpStatusCode.Conflict);
             // A prior crash or concurrent provisioning can leave the organization already created.
-            orgId = await FindOrganizationAsync(customer.Id, ct)
+            orgId = await FindOrganizationAsync(customer.Id, null, ResourceIdentity.OrganizationName(customer), ct)
                 ?? throw new HttpRequestException("Grafana organization creation was not visible.");
         }
         if (organizationId is { } stored && stored != orgId)
@@ -36,6 +37,19 @@ public sealed class GrafanaProvisioner(
         {
             using var response = await SendAsync(HttpMethod.Post, "api/dashboards/db", orgId,
                 new { dashboard, overwrite = true, message = "EGWN customer reconciliation" }, ct);
+        }
+        var homeUid = customer.EnergyCommunities is { Count: > 0 } communities
+            ? ResourceIdentity.Dashboard(customer.Id, "community", communities[0].Id)
+            : ResourceIdentity.Dashboard(customer.Id, "customer", customer.Id);
+        using (var saved = await SendAsync(HttpMethod.Put, "api/org/preferences", orgId,
+            new { homeDashboardUID = homeUid }, ct))
+        {
+        }
+        using (var verified = await SendAsync(HttpMethod.Get, "api/org/preferences", orgId, null, ct))
+        {
+            var preference = await verified.Content.ReadFromJsonAsync<JsonObject>(cancellationToken: ct);
+            if (preference?["homeDashboardUID"]?.GetValue<string>() != homeUid)
+                throw new HttpRequestException("Grafana did not persist the organization home dashboard.");
         }
 
         var desired = dashboards.Select(d => d["uid"]!.GetValue<string>()).ToHashSet(StringComparer.Ordinal);
@@ -57,14 +71,17 @@ public sealed class GrafanaProvisioner(
             using var deleted = await SendAsync(HttpMethod.Delete,
                 $"api/dashboards/uid/{Uri.EscapeDataString(uid)}", orgId, null, ct, HttpStatusCode.NotFound);
         }
-        await SynchronizeOrgMappingAsync(ct);
-        if (source is not null) await measurements!.EnableAsync(customer.CustomerNumber, customer.Id, ct);
+        using (var renamed = await SendAsync(HttpMethod.Put, $"api/orgs/{orgId}", null,
+            new { name = ResourceIdentity.OrganizationName(customer) }, ct))
+        {
+        }
+        await SynchronizeOrgMappingAsync(ct, customer.Id, orgId.Value);
         return orgId.Value;
     }
 
     public async Task DeleteAsync(Guid customerId, long? organizationId, CancellationToken ct)
     {
-        var actual = await FindOrganizationAsync(customerId, ct);
+        var actual = await FindOrganizationAsync(customerId, organizationId, null, ct);
         if (actual is null)
         {
             await DeleteTenantAsync(customerId, ct);
@@ -81,10 +98,7 @@ public sealed class GrafanaProvisioner(
     private async Task DeleteTenantAsync(Guid customerId, CancellationToken ct)
     {
         if (measurements is not { Enabled: true }) return;
-        var state = await db.Customers.AsNoTracking().SingleAsync(c => c.Id == customerId, ct);
-        var customer = System.Text.Json.JsonSerializer.Deserialize<CustomerSnapshot>(state.SnapshotJson, EventPolicy.Json)
-            ?? throw new InvalidEventException("Customer snapshot missing on deletion.");
-        await measurements.DeleteAsync(customer.CustomerNumber, customerId, ct);
+        await measurements.DeleteAsync(customerId, ct);
     }
 
     private async Task EnsureDataSourceAsync(Guid customerId, long orgId, TenantDataSource source, CancellationToken ct)
@@ -113,11 +127,12 @@ public sealed class GrafanaProvisioner(
         var result = await verified.Content.ReadFromJsonAsync<JsonObject>(cancellationToken: ct);
         if (result?["orgId"]?.GetValue<long>() != orgId ||
             result["user"]?.GetValue<string>() != source.User ||
-            result["database"]?.GetValue<string>() != source.Database)
+            result["database"]?.GetValue<string>() != source.Database ||
+            result["secureJsonFields"]?["password"]?.GetValue<bool>() != true)
             throw new HttpRequestException("Grafana did not persist the customer-scoped datasource.");
     }
 
-    private async Task SynchronizeOrgMappingAsync(CancellationToken ct)
+    private async Task SynchronizeOrgMappingAsync(CancellationToken ct, Guid? activeCustomerId = null, long? activeOrgId = null)
     {
         // All callers already hold a customer transaction; serialize changes to the shared SSO configuration.
         await db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_xact_lock(617302947146132)", ct);
@@ -127,9 +142,17 @@ public sealed class GrafanaProvisioner(
             using var response = await SendAsync(HttpMethod.Get, $"api/orgs?perpage=1000&page={page}", null, null, ct);
             var organizations = await response.Content.ReadFromJsonAsync<List<NamedOrganization>>(EventPolicy.Json, ct) ?? [];
             foreach (var org in organizations)
+            {
                 if (org.Name.StartsWith("egwn-", StringComparison.Ordinal) &&
-                    Guid.TryParseExact(org.Name[5..], "N", out _))
-                    mappings.Add($"{org.Name}:{org.Id}:Viewer");
+                    Guid.TryParseExact(org.Name[5..], "N", out var legacyId))
+                    mappings.Add($"{ResourceIdentity.Organization(legacyId)}:{org.Id}:Viewer");
+                else
+                {
+                    var owner = activeOrgId == org.Id ? activeCustomerId : await FindDashboardOwnerAsync(org.Id, ct);
+                    if (owner is { } customerId)
+                        mappings.Add($"{ResourceIdentity.Organization(customerId)}:{org.Id}:Viewer");
+                }
+            }
             if (organizations.Count < 1000) break;
         }
         using var updated = await SendAsync(HttpMethod.Patch, "api/v1/sso-settings/generic_oauth", null,
@@ -151,12 +174,78 @@ public sealed class GrafanaProvisioner(
             throw new HttpRequestException("Grafana did not persist the expected organization mapping.");
     }
 
-    private async Task<long?> FindOrganizationAsync(Guid customerId, CancellationToken ct)
+    private async Task<long?> FindOrganizationAsync(Guid customerId, long? storedId, string? desiredName,
+        CancellationToken ct)
     {
+        if (storedId is { } id)
+        {
+            using var stored = await SendAsync(HttpMethod.Get, $"api/orgs/{id}", null, null, ct, HttpStatusCode.NotFound);
+            if (stored.StatusCode != HttpStatusCode.NotFound) return id;
+        }
         using var response = await SendAsync(HttpMethod.Get,
             $"api/orgs/name/{ResourceIdentity.Organization(customerId)}", null, null, ct, HttpStatusCode.NotFound);
-        return response.StatusCode == HttpStatusCode.NotFound ? null :
-            (await response.Content.ReadFromJsonAsync<OrganizationResult>(EventPolicy.Json, ct))?.Id;
+        if (response.StatusCode != HttpStatusCode.NotFound)
+            return (await response.Content.ReadFromJsonAsync<OrganizationResult>(EventPolicy.Json, ct))?.Id;
+
+        if (desiredName is not null)
+        {
+            using var named = await SendAsync(HttpMethod.Get,
+                $"api/orgs/name/{Uri.EscapeDataString(desiredName)}", null, null, ct, HttpStatusCode.NotFound);
+            if (named.StatusCode == HttpStatusCode.NotFound) return null;
+            var candidate = await named.Content.ReadFromJsonAsync<OrganizationResult>(EventPolicy.Json, ct)
+                ?? throw new InvalidEventException("Grafana organization response is incomplete.");
+            if (!await HasOwnedDashboardAsync(customerId, candidate.Id, ct))
+                throw new InvalidEventException("Grafana organization name belongs to an unmanaged organization.");
+            return candidate.Id;
+        }
+
+        long? match = null;
+        for (var page = 0; ; page++)
+        {
+            using var listed = await SendAsync(HttpMethod.Get, $"api/orgs?perpage=1000&page={page}", null, null, ct);
+            var organizations = await listed.Content.ReadFromJsonAsync<List<NamedOrganization>>(EventPolicy.Json, ct)
+                ?? throw new InvalidEventException("Grafana organization list is unavailable.");
+            foreach (var org in organizations)
+            {
+                if (!await HasOwnedDashboardAsync(customerId, org.Id, ct)) continue;
+                if (match is not null)
+                    throw new InvalidEventException("Multiple Grafana organizations contain customer dashboards.");
+                match = org.Id;
+            }
+            if (organizations.Count < 1000) return match;
+        }
+    }
+
+    private async Task<bool> HasOwnedDashboardAsync(Guid customerId, long orgId, CancellationToken ct)
+    {
+        using var response = await SendAsync(HttpMethod.Get,
+            $"api/search?type=dash-db&tag={ResourceIdentity.OwnerTag(customerId)}&limit=1",
+            orgId, null, ct);
+        var dashboards = await response.Content.ReadFromJsonAsync<List<JsonObject>>(cancellationToken: ct)
+            ?? throw new InvalidEventException("Grafana dashboard search is unavailable.");
+        return dashboards.Count > 0;
+    }
+
+    private async Task<Guid?> FindDashboardOwnerAsync(long orgId, CancellationToken ct)
+    {
+        Guid? owner = null;
+        for (var page = 1; ; page++)
+        {
+            using var response = await SendAsync(HttpMethod.Get,
+                $"api/search?type=dash-db&limit=1000&page={page}", orgId, null, ct);
+            var dashboards = await response.Content.ReadFromJsonAsync<List<SearchResult>>(EventPolicy.Json, ct)
+                ?? throw new InvalidEventException("Grafana dashboard search is unavailable.");
+            foreach (var tag in dashboards.SelectMany(d => d.Tags ?? []))
+            {
+                const string prefix = "egwn-managed-";
+                if (!tag.StartsWith(prefix, StringComparison.Ordinal) ||
+                    !Guid.TryParseExact(tag[prefix.Length..], "N", out var customerId)) continue;
+                if (owner is { } existing && existing != customerId)
+                    throw new InvalidEventException("Grafana organization contains dashboards from multiple customers.");
+                owner = customerId;
+            }
+            if (dashboards.Count < 1000) return owner;
+        }
     }
 
     private async Task<HttpResponseMessage> SendAsync(
@@ -173,7 +262,9 @@ public sealed class GrafanaProvisioner(
         {
             var status = response.StatusCode;
             response.Dispose();
-            throw new HttpRequestException($"Grafana request failed with status {(int)status}.", null, status);
+            var target = request.RequestUri!.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.UriEscaped);
+            throw new HttpRequestException(
+                $"Grafana request {method} {target} failed with HTTP {(int)status} ({status}).", null, status);
         }
         return response;
     }
@@ -184,101 +275,194 @@ public sealed class GrafanaProvisioner(
         var result = new List<JsonObject>();
         var points = customer.MeteringPoints ?? [];
         var communities = customer.EnergyCommunities ?? [];
-        var summary = new StringBuilder();
-        summary.AppendLine($"# {Escape(customer.Name)}").AppendLine()
-            .AppendLine($"Customer: {Escape(customer.CustomerNumber)}").AppendLine()
-            .AppendLine(source is null ? "Measurement queries are not connected yet." :
-                "Measurements are limited to this customer and their authorized communities.").AppendLine();
+        var links = new JsonArray();
+        foreach (var community in communities)
+            links.Add(new JsonObject
+            {
+                ["title"] = $"EG · {community.Name}",
+                ["url"] = $"/d/{ResourceIdentity.Dashboard(customer.Id, "community", community.Id)}",
+                ["type"] = "link"
+            });
+        foreach (var point in points)
+            links.Add(new JsonObject
+            {
+                ["title"] = $"Zählpunkt · {(point.EnergyDirection == "generation" ? "Erzeugung" : "Bezug")} · {point.MeteringPointCode}",
+                ["url"] = $"/d/{ResourceIdentity.Dashboard(customer.Id, "meter", point.Id)}",
+                ["type"] = "link"
+            });
         foreach (var point in points)
         {
             var uid = ResourceIdentity.Dashboard(customer.Id, "meter", point.Id);
-            summary.AppendLine($"- [{Escape(point.MeteringPointCode)}](/d/{uid})");
-            var meterDashboard = Dashboard(customer, uid, $"Meter - {point.MeteringPointCode}",
-                $"{Escape(point.Description ?? point.MeteringPointCode)}\n\nDirection: {Escape(point.EnergyDirection)}" +
-                (source is null ? "\n\nMeasurement queries are not connected yet." : ""),
-                overviewUid);
+            var direction = point.EnergyDirection == "generation" ? "Erzeugung" : "Bezug";
+            var meterDashboard = Dashboard(customer, uid, $"Zählpunkt · {direction} · {point.MeteringPointCode}",
+                source is null ? "Messdaten sind noch nicht verbunden." : "", links);
             if (source is not null)
             {
                 var memberCommunities = communities.Where(c => c.MeteringPoints.Any(p => p.Id == point.Id)).ToList();
                 var panels = (JsonArray)meterDashboard["panels"]!;
-                foreach (var community in memberCommunities)
+                for (var communityIndex = 0; communityIndex < memberCommunities.Count; communityIndex++)
                 {
-                    var start = 18 + (panels.Count - 1) / 5 * 13;
+                    var community = memberCommunities[communityIndex];
+                    var start = communityIndex * (point.EnergyDirection == "generation" ? 31 : 43);
                     var scope = $"""
                         FROM {source.Schema}.raw_measurements r
                         JOIN {source.Schema}.meter_points mp ON mp."Id" = r.meter_id
                         WHERE $__timeFilter(r.timestamp) AND r.community_id = {SqlText(community.SourceId!)}
                           AND mp.meter_point_number = {SqlText(point.MeteringPointCode)}
                         """;
-                    var generated = point.EnergyDirection == "generation";
-                    var statNames = generated
-                        ? new[] { "Erzeugung", "Netzeinspeisung", "Abgabe an EG", "EG-Anteil" }
-                        : new[] { "Verbrauch", "Netzbezug", "Bezug aus EG", "EG-Deckungsgrad" };
-                    var expressions = new[]
-                    {
-                        "SUM(r.total_consumption)", "SUM(r.grid_share)", "SUM(r.community_share)",
-                        "SUM(r.community_share) / NULLIF(SUM(r.total_consumption), 0)"
-                    };
-                    for (var index = 0; index < expressions.Length; index++)
-                        panels.Add(StatPanel(panels.Count + 1, $"{community.Name} - {statNames[index]}",
-                            $"SELECT {expressions[index]} AS \"value\" {scope}", customer.Id,
-                            index == 3 ? "percentunit" : "kwatth", start, index * 6));
-                    var sql = $"""
-                        SELECT date_bin($__interval_ms * INTERVAL '1 millisecond',
-                          r.timestamp, TIMESTAMPTZ '2000-01-01') AS "time",
-                          SUM(r.total_consumption) AS "Gesamt",
-                          SUM(r.grid_share) AS "Netz",
-                          SUM(r.community_share) AS "Energiegemeinschaft"
-                        {scope}
-                        GROUP BY 1 ORDER BY 1
-                        """;
-                    panels.Add(MeasurementPanel(panels.Count + 1, $"{community.Name} - " +
-                        (generated ? "Erzeugung" : "Bezug"),
-                        sql, customer.Id, "kwatth", start + 4));
+                    AddEnergyPanels(panels, customer.Id, scope, community.Name,
+                        point.EnergyDirection == "generation", start);
                 }
             }
+            meterDashboard["description"] = $"{customer.Name} | {point.Description ?? point.MeteringPointCode}";
             result.Add(meterDashboard);
         }
         foreach (var community in communities)
         {
             var uid = ResourceIdentity.Dashboard(customer.Id, "community", community.Id);
-            summary.AppendLine($"- [{Escape(community.Name)}](/d/{uid})");
-            var text = new StringBuilder($"# {Escape(community.Name)}\n\n");
-            if (source is null) text.AppendLine("Measurement queries are not connected yet.").AppendLine();
-            foreach (var point in community.MeteringPoints)
-                text.AppendLine($"- {Escape(point.MeteringPointCode)}: {point.ParticipationPercentage.ToString(System.Globalization.CultureInfo.InvariantCulture)}%");
-            var communityDashboard = Dashboard(customer, uid, $"Community - {community.Name}", text.ToString(), overviewUid);
+            var communityDashboard = Dashboard(customer, uid,
+                $"Energiegemeinschaft · Übersicht (gesamt) · {community.Name}",
+                source is null ? "Messdaten sind noch nicht verbunden." : "", links);
+            communityDashboard["description"] =
+                $"{community.Name} | Aggregierte Messdaten aller freigegebenen Zählpunkte";
             if (source is not null)
             {
                 var panels = (JsonArray)communityDashboard["panels"]!;
-                foreach (var (direction, index) in new[] { "consumption", "generation" }.Select((d, i) => (d, i)))
+                var start = 0;
+                foreach (var direction in new[] { "generation", "consumption" })
                 {
                     var scope = $"""
-                        FROM {source.Schema}.community_totals
-                        WHERE $__timeFilter(timestamp) AND community_id = {SqlText(community.SourceId!)}
-                          AND energy_direction = {SqlText(direction)}
+                        FROM {source.Schema}.community_hourly_measurements r
+                        WHERE $__timeFilter(r.timestamp) AND r.community_id = {SqlText(community.SourceId!)}
+                          AND r.energy_direction = {SqlText(direction)}
                         """;
-                    panels.Add(StatPanel(panels.Count + 1,
-                        direction == "consumption" ? "Verbrauch der Gemeinschaft" : "Erzeugung der Gemeinschaft",
-                        $"SELECT SUM(total) AS \"value\" {scope}", customer.Id, "kwatth", 18, index * 12, 12));
-                    var sql = $"""
-                        SELECT date_bin($__interval_ms * INTERVAL '1 millisecond',
-                          timestamp, TIMESTAMPTZ '2000-01-01') AS "time",
-                          SUM(total) AS "Gesamt", SUM(grid_share) AS "Netz",
-                          SUM(community_share) AS "Energiegemeinschaft"
-                        {scope}
-                        GROUP BY 1 ORDER BY 1
-                        """;
-                    panels.Add(MeasurementPanel(panels.Count + 1,
-                        direction == "consumption" ? "Gesamter Bezug der Energiegemeinschaft" :
-                        "Gesamte Erzeugung der Energiegemeinschaft", sql, customer.Id, "kwatth",
-                        22 + index * 9));
+                    AddEnergyPanels(panels, customer.Id, scope, "Gemeinschaft gesamt",
+                        direction == "generation", start, hourly: true);
+                    start += direction == "generation" ? 31 : 43;
                 }
             }
             result.Add(communityDashboard);
         }
-        result.Add(Dashboard(customer, overviewUid, $"{customer.CustomerNumber} - {customer.Name}", summary.ToString(), overviewUid));
+        if (communities.Count == 0)
+            result.Add(Dashboard(customer, overviewUid, "Energiegemeinschaften · Übersicht",
+                "Noch keine Energiegemeinschaft zugeordnet.", links));
         return result;
+    }
+
+    private static void AddEnergyPanels(JsonArray panels, Guid customerId, string scope, string label,
+        bool generation, int y, bool hourly = false)
+    {
+        var bucketSize = hourly ? "1 hour" : "15 minutes";
+        var powerMultiplier = hourly ? "" : " * 4";
+        var localHour = hourly ? "bucket AT TIME ZONE 'Europe/Vienna'" : "bucket";
+        var names = generation
+            ? new[] { "Erzeugung", "Netzeinspeisung", "Abgabe an EG", "EG-Anteil", "Spitzenleistung", "Ø Leistung" }
+            : new[] { "Verbrauch", "Netzbezug", "Bezug aus EG", "EG-Deckungsgrad", "Spitzenleistung", "Ø Leistung" };
+        var expressions = new[]
+        {
+            "SUM(r.total_consumption)", "SUM(r.grid_share)", "SUM(r.community_share)",
+            "SUM(r.community_share) / NULLIF(SUM(r.total_consumption), 0)"
+        };
+        for (var index = 0; index < names.Length; index++)
+        {
+            var sql = index < 4 ? $"SELECT {expressions[index]} AS \"value\" {scope}" : $"""
+                SELECT {(index == 4 ? "MAX" : "AVG")}(bucket_energy){powerMultiplier} AS "value"
+                FROM (
+                  SELECT date_bin(INTERVAL '{bucketSize}', r.timestamp,
+                    TIMESTAMPTZ '2000-01-01') AS bucket, SUM(r.total_consumption) AS bucket_energy
+                  {scope} GROUP BY 1
+                ) intervals
+                """;
+            panels.Add(StatPanel(panels.Count + 1, $"{label} · {names[index]}",
+                sql, customerId,
+                index == 3 ? "percentunit" : index >= 4 ? "kwatt" : "kwatth",
+                y, index * 4, 4));
+        }
+        panels.Add(MeasurementPanel(panels.Count + 1,
+            $"{label} · {(generation ? "Erzeugung" : "Verbrauch")} · Netz vs. EG",
+            $"""
+            SELECT date_bin($__interval_ms * INTERVAL '1 millisecond',
+              r.timestamp, TIMESTAMPTZ '2000-01-01') AS "time",
+              SUM(r.grid_share) AS "Netz", SUM(r.community_share) AS "Energiegemeinschaft"
+            {scope} GROUP BY 1 ORDER BY 1
+            """, customerId, "kwatth", y + 4, 0, 12));
+        panels.Add(MeasurementPanel(panels.Count + 1, $"{label} · EG-Anteil im Verlauf",
+            $"""
+            SELECT date_bin($__interval_ms * INTERVAL '1 millisecond',
+              r.timestamp, TIMESTAMPTZ '2000-01-01') AS "time",
+              SUM(r.community_share) / NULLIF(SUM(r.total_consumption), 0) AS "EG-Anteil"
+            {scope} GROUP BY 1 ORDER BY 1
+            """, customerId, "percentunit", y + 4, 12, 12));
+        panels.Add(MeasurementPanel(panels.Count + 1,
+            $"{label} · {(hourly ? "Stunden-Leistung" : "Viertelstunden-Leistung")}",
+            $"""
+            SELECT date_bin(INTERVAL '{bucketSize}', r.timestamp,
+              TIMESTAMPTZ '2000-01-01') AS "time",
+              SUM(r.total_consumption){powerMultiplier} AS "Ø Leistung"
+            {scope} GROUP BY 1 ORDER BY 1
+            """, customerId, "kwatt", y + 13, 0, 12));
+        panels.Add(BarPanel(panels.Count + 1, $"{label} · Ø Stundenprofil{(hourly ? " (Wien)" : "")}",
+            $"""
+            SELECT LPAD(EXTRACT(HOUR FROM {localHour})::int::text, 2, '0') || ':00' AS "Stunde",
+              AVG(bucket_energy){powerMultiplier} AS "Ø Leistung"
+            FROM (
+              SELECT date_bin(INTERVAL '{bucketSize}', r.timestamp,
+                TIMESTAMPTZ '2000-01-01') AS bucket, SUM(r.total_consumption) AS bucket_energy
+              {scope} GROUP BY 1
+            ) intervals GROUP BY 1 ORDER BY 1
+            """, customerId, "kwatt", y + 13, 12));
+        const string timeFilter = "$__timeFilter(r.timestamp)";
+        if (!scope.Contains(timeFilter, StringComparison.Ordinal))
+            throw new InvalidOperationException("The measurement scope is missing its time filter.");
+        var previousScope = scope.Replace(timeFilter,
+            "r.timestamp BETWEEN ($__timeFrom()::timestamptz - INTERVAL '7 days') " +
+            "AND ($__timeTo()::timestamptz - INTERVAL '7 days')", StringComparison.Ordinal);
+        var comparison = MeasurementPanel(panels.Count + 1,
+            $"{label} · {(generation ? "Erzeugung" : "Verbrauch")} · Vergleich mit Vorwoche (-7 Tage)",
+            $"""
+            SELECT date_bin($__interval_ms * INTERVAL '1 millisecond',
+              r.timestamp, TIMESTAMPTZ '2000-01-01') AS "time",
+              SUM(r.total_consumption) AS "Aktuell"
+            {scope} GROUP BY 1 ORDER BY 1
+            """, customerId, "kwatth", y + 22);
+        var previous = comparison["targets"]![0]!.DeepClone();
+        previous["refId"] = "B";
+        previous["rawSql"] = $"""
+            SELECT date_bin($__interval_ms * INTERVAL '1 millisecond',
+              r.timestamp + INTERVAL '7 days', TIMESTAMPTZ '2000-01-01') AS "time",
+              SUM(r.total_consumption) AS "Vorwoche"
+            {previousScope} GROUP BY 1 ORDER BY 1
+            """;
+        comparison["targets"]!.AsArray().Add(previous);
+        panels.Add(comparison);
+        if (!generation)
+        {
+            var hourlyColumns = string.Join(",\n", Enumerable.Range(0, 24).Select(hour =>
+                $"SUM(energy) FILTER (WHERE EXTRACT(HOUR FROM bucket AT TIME ZONE 'Europe/Vienna') = {hour}) AS \"{hour}\""));
+            var heatmap = MeasurementPanel(panels.Count + 1, $"{label} · Verbrauch nach Tag und Stunde (Wien)",
+                $"""
+                WITH hourly AS (
+                  SELECT date_bin(INTERVAL '1 hour', r.timestamp,
+                    TIMESTAMPTZ '2000-01-01') AS bucket, SUM(r.total_consumption) AS energy
+                  {scope} GROUP BY 1
+                )
+                SELECT date_trunc('day', bucket, 'Europe/Vienna') AS "time",
+                  {hourlyColumns}
+                FROM hourly GROUP BY 1 ORDER BY 1
+                """, customerId, "kwatth", y + 31);
+            heatmap["type"] = "heatmap";
+            heatmap["gridPos"]!["h"] = 12;
+            heatmap["fieldConfig"]!["defaults"]!["unit"] = "none";
+            heatmap["options"] = new JsonObject
+            {
+                ["calculate"] = false,
+                ["mode"] = "heatmap",
+                ["color"] = new JsonObject { ["mode"] = "scheme", ["scheme"] = "Oranges", ["steps"] = 64 },
+                ["yAxis"] = new JsonObject { ["axisPlacement"] = "left", ["axisLabel"] = "Stunde (Wien)", ["unit"] = "none" },
+                ["cellValues"] = new JsonObject { ["unit"] = "kwatth" }
+            };
+            panels.Add(heatmap);
+        }
     }
 
     private static string SqlText(string value) =>
@@ -293,19 +477,29 @@ public sealed class GrafanaProvisioner(
         panel["targets"]![0]!["format"] = "table";
         panel["options"] = new JsonObject
         {
+            ["colorMode"] = "value",
             ["reduceOptions"] = new JsonObject { ["calcs"] = new JsonArray("lastNotNull"),
                 ["fields"] = "", ["values"] = false }
         };
         return panel;
     }
 
-    private static JsonObject MeasurementPanel(int id, string title, string sql, Guid customerId, string unit, int y)
+    private static JsonObject BarPanel(int id, string title, string sql, Guid customerId, string unit, int y, int x)
+    {
+        var panel = MeasurementPanel(id, title, sql, customerId, unit, y, x, 12);
+        panel["type"] = "barchart";
+        panel["targets"]![0]!["format"] = "table";
+        return panel;
+    }
+
+    private static JsonObject MeasurementPanel(int id, string title, string sql, Guid customerId, string unit,
+        int y, int x = 0, int width = 24)
     {
         var uid = ResourceIdentity.Dashboard(customerId, "datasource", customerId);
         return new JsonObject
         {
             ["id"] = id, ["title"] = title, ["type"] = "timeseries",
-            ["gridPos"] = new JsonObject { ["h"] = 9, ["w"] = 24, ["x"] = 0, ["y"] = y },
+            ["gridPos"] = new JsonObject { ["h"] = 9, ["w"] = width, ["x"] = x, ["y"] = y },
             ["datasource"] = new JsonObject { ["type"] = "grafana-postgresql-datasource", ["uid"] = uid },
             ["targets"] = new JsonArray(new JsonObject
             {
@@ -317,20 +511,20 @@ public sealed class GrafanaProvisioner(
         };
     }
 
-    private static JsonObject Dashboard(CustomerSnapshot customer, string uid, string title, string content, string home) =>
+    private static JsonObject Dashboard(CustomerSnapshot customer, string uid, string title, string content, JsonArray links) =>
         new()
         {
             ["uid"] = uid, ["title"] = title, ["schemaVersion"] = 39,
             ["editable"] = false,
             ["tags"] = new JsonArray(ResourceIdentity.OwnerTag(customer.Id)),
-            ["links"] = new JsonArray(new JsonObject { ["title"] = "Customer overview", ["url"] = $"/d/{home}", ["type"] = "link" }),
-            ["panels"] = new JsonArray(new JsonObject
+            ["links"] = links.DeepClone(),
+            ["panels"] = content.Length == 0 ? new JsonArray() : new JsonArray(new JsonObject
             {
-                ["id"] = 1, ["type"] = "text", ["title"] = "Customer information",
-                ["gridPos"] = new JsonObject { ["h"] = 18, ["w"] = 24, ["x"] = 0, ["y"] = 0 },
-                ["options"] = new JsonObject { ["mode"] = "markdown", ["content"] = content }
+                ["id"] = 1, ["type"] = "text", ["title"] = "Hinweis",
+                ["gridPos"] = new JsonObject { ["h"] = 3, ["w"] = 24, ["x"] = 0, ["y"] = 0 },
+                ["options"] = new JsonObject { ["mode"] = "markdown", ["content"] = Escape(content) }
             }),
-            ["time"] = new JsonObject { ["from"] = "now-30d", ["to"] = "now" }
+            ["time"] = new JsonObject { ["from"] = "now-7d", ["to"] = "now" }
         };
 
     private static string Escape(string value) =>
@@ -338,6 +532,6 @@ public sealed class GrafanaProvisioner(
             .Replace("*", "\\*").Replace("_", "\\_").Replace("`", "\\`").Replace("#", "\\#");
 
     private sealed record OrganizationResult(long Id);
-    private sealed record SearchResult(string Uid);
+    private sealed record SearchResult(string Uid, List<string>? Tags = null);
     private sealed record NamedOrganization(long Id, string Name);
 }

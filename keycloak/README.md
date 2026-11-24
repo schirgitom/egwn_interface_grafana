@@ -340,6 +340,9 @@ OAuth configuration includes `role_attribute_path = 'None'`,
 `role_attribute_strict = true`, `allow_assign_grafana_admin = false`,
 `skip_org_role_sync = false`, `org_attribute_path = [egwn_org]`, and an **explicit**
 `org_mapping` entry `egwn-<customerN>:<orgId>:Viewer` for every permitted customer.
+This claim is an immutable customer identity, not the Grafana display name
+(`<customerNumber> - <customerName>`); changing a customer's name does not
+change its Keycloak claim or Grafana organization ID.
 The deployment synchronizes this allowlist through Grafana OSS SSO settings
 `PATCH /api/v1/sso-settings/generic_oauth` (runtime reload, no restart). The global
 role is deliberately `None`; Viewer comes only from a recognized organization

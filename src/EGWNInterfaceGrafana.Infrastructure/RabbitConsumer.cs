@@ -61,7 +61,7 @@ public sealed class RabbitConsumer(
                     catch (Exception exception)
                     {
                         // Callback failures must tear down the channel so unacknowledged messages are redelivered.
-                        logger.LogError("RabbitMQ callback failed ({ErrorType}); reconnecting", exception.GetType().Name);
+                        logger.LogError(exception, "RabbitMQ callback failed ({ErrorType}); reconnecting", exception.GetType().Name);
                         status.Connected = false;
                         disconnected.TrySetResult();
                     }
@@ -74,7 +74,7 @@ public sealed class RabbitConsumer(
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception exception)
             {
-                logger.LogError("RabbitMQ connection failed ({ErrorType}); reconnecting", exception.GetType().Name);
+                logger.LogError(exception, "RabbitMQ connection failed ({ErrorType}); reconnecting", exception.GetType().Name);
             }
             finally { status.Connected = false; }
             try { await Task.Delay(TimeSpan.FromSeconds(settings.RetrySeconds), stoppingToken); }
@@ -100,12 +100,12 @@ public sealed class RabbitConsumer(
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception exception)
             {
-                logger.LogWarning(
-                    "Event processing failed, attempt {Attempt}/{MaxAttempts}, error {ErrorType}, HTTP {HttpStatus}, SQL {SqlState}, reason {Reason}",
-                    attempt, settings.MaxAttempts, exception.GetType().Name,
+                logger.LogWarning(exception,
+                    "Event processing failed for message {MessageId} on queue {Queue}, attempt {Attempt}/{MaxAttempts}, error {ErrorType}, HTTP {HttpStatus}, SQL {SqlState}, reason {Reason}",
+                    delivery.BasicProperties.MessageId, settings.Queue, attempt, settings.MaxAttempts, exception.GetType().Name,
                     (exception as HttpRequestException)?.StatusCode,
                     (exception as PostgresException ?? exception.InnerException as PostgresException)?.SqlState,
-                    (exception as InvalidEventException)?.Message);
+                    exception.Message);
                 if (exception is InvalidEventException || attempt == settings.MaxAttempts)
                 {
                     var properties = new BasicProperties
@@ -118,7 +118,8 @@ public sealed class RabbitConsumer(
                     await channel.BasicPublishAsync("", settings.Queue + ".dead", mandatory: true,
                         basicProperties: properties, body: delivery.Body, cancellationToken: ct);
                     await channel.BasicAckAsync(delivery.DeliveryTag, false, ct);
-                    logger.LogError("Message moved to dead-letter queue {Queue}", settings.Queue + ".dead");
+                    logger.LogError("Message {MessageId} moved to dead-letter queue {Queue}",
+                        delivery.BasicProperties.MessageId, settings.Queue + ".dead");
                     return;
                 }
                 await Task.Delay(TimeSpan.FromSeconds(Math.Min(60, settings.RetrySeconds * Math.Pow(2, attempt - 1))), ct);

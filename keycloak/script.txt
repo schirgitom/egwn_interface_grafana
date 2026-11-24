@@ -1,0 +1,8 @@
+   $env:EGWN_KEYCLOAK_SETUP_URL = 'https://2-29-27-39.nip.io'
+   $env:EGWN_GRAFANA_REDIRECT_URI = 'https://grafana.2-29-27-39.nip.io/login/generic_oauth'
+
+   $env:KC_BOOTSTRAP_ADMIN_USERNAME = 'admin'
+   $env:KC_BOOTSTRAP_ADMIN_PASSWORD = 'u12IhECMb8RCoA'
+
+   $env:EGWN_GRAFANA_CLIENT_SECRET = 'dlZyKWYuUnWhO7delxizuCu98W8Ptz3G'
+   $env:EGWN_PROVISIONER_CLIENT_SECRET = 'VQNHJ4J9pHJ9JOQadq7oArcaX2SEZcsi'
