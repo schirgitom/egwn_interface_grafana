@@ -19,7 +19,7 @@ public sealed record CommunityMeteringPoint(
 
 public sealed record EnergyCommunity(
     Guid Id, string Name, string? Source, string? SourceId,
-    IReadOnlyList<CommunityMeteringPoint> MeteringPoints);
+    IReadOnlyList<CommunityMeteringPoint> MeteringPoints, string? LogoUrl = null);
 
 public sealed class CustomerState
 {

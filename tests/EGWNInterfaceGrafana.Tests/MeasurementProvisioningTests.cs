@@ -64,20 +64,60 @@ public sealed class MeasurementProvisioningTests
             new TenantDataSource(schema, schema, "unit-test-password", "egwn-timescaledb", 5432, "egwndata2"));
         var community = dashboards.Single(d => d["title"]!.GetValue<string>().StartsWith("Energiegemeinschaft ·"));
         var panels = community["panels"]!.AsArray();
-        Assert.Equal(12, panels.Count(p => p!["type"]!.GetValue<string>() == "stat"));
+        Assert.Equal(10, panels.Count(p => p!["type"]!.GetValue<string>() == "stat"));
         Assert.All(panels, p => Assert.NotEqual("text", p!["type"]!.GetValue<string>()));
         Assert.Contains("Übersicht (gesamt)", community["title"]!.GetValue<string>());
         Assert.Contains($"{schema}.community_hourly_measurements", panels.ToJsonString());
         Assert.DoesNotContain($"{schema}.raw_measurements", panels.ToJsonString());
         Assert.Contains("r.energy_direction", panels.ToJsonString());
         Assert.DoesNotContain("mp.meter_point_number", panels.ToJsonString());
-        Assert.Contains("Stunden-Leistung", panels.ToJsonString());
+        Assert.Contains(panels, p => p!["title"]!.GetValue<string>() ==
+            "Verbrauch – Netzbezug vs. Bezug aus EG");
+        Assert.Contains(panels, p => p!["title"]!.GetValue<string>() ==
+            "Ø Stundenprofil – Werktag vs. Wochenende");
+        Assert.Contains(panels, p => p!["title"]!.GetValue<string>() ==
+            "Leistung – Mittel und Maximum je Intervall");
+        Assert.Contains(panels, p => p!["title"]!.GetValue<string>() == "Top 10 Lastspitzen");
+        Assert.DoesNotContain(panels, p => p!["title"]!.GetValue<string>()
+            .Contains("Stündliche Leistung", StringComparison.Ordinal));
+        Assert.DoesNotContain(panels, p => p!["title"]!.GetValue<string>()
+            .Contains("Lastdauerlinie", StringComparison.Ordinal));
         Assert.DoesNotContain(" * 4 AS", panels.ToJsonString());
         Assert.Equal(2, community["links"]!.AsArray().Count);
     }
 
     [Fact]
-    public void PreviousWeekComparisonAndHourlyConsumptionHeatmapStayCustomerScoped()
+    public void CommunityLogoUrlRendersOneCommunityScopedLogoPanel()
+    {
+        var customer = PolicyTests.Message().Customer;
+        var community = customer.EnergyCommunities![0] with
+        { LogoUrl = "https://assets.example.invalid/egwn/logo_(weiz).svg" };
+        customer = customer with { EnergyCommunities = [community] };
+        var schema = $"grafana_customer_{customer.Id:N}";
+        var source = new TenantDataSource(schema, schema, "unit-test-password", "egwn-timescaledb", 5432, "egwndata2");
+
+        var dashboards = GrafanaProvisioner.BuildDashboards(customer, source);
+        var communityDashboard = dashboards.Single(d =>
+            d["title"]!.GetValue<string>().StartsWith("Energiegemeinschaft ·"));
+        var logo = Assert.Single(communityDashboard["panels"]!.AsArray(),
+            p => p!["title"]!.GetValue<string>().StartsWith("Logo ·"));
+
+        Assert.Equal("text", logo!["type"]!.GetValue<string>());
+        Assert.Contains("logo_%28weiz%29.svg", logo["options"]!["content"]!.GetValue<string>());
+        Assert.Equal(20, logo["gridPos"]!["x"]!.GetValue<int>());
+        var meterDashboard = Assert.Single(dashboards,
+            d => d["title"]!.GetValue<string>().StartsWith("Zählpunkt ·"));
+        Assert.Single(meterDashboard["panels"]!.AsArray(),
+            p => p!["title"]!.GetValue<string>().StartsWith("Logo ·"));
+        var noSourceDashboard = GrafanaProvisioner.BuildDashboards(customer).Single(d =>
+            d["title"]!.GetValue<string>().StartsWith("Energiegemeinschaft ·"));
+        var noSourceLogo = Assert.Single(noSourceDashboard["panels"]!.AsArray(),
+            p => p!["title"]!.GetValue<string>().StartsWith("Logo ·"));
+        Assert.Equal(3, noSourceLogo!["gridPos"]!["y"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public void PreviousWeekComparisonAndRequestedChartsStayCustomerScoped()
     {
         var customer = EventPolicy.Parse(System.Text.Encoding.UTF8.GetBytes(
             PolicyTests.OriginalCustomerEventJson)).Customer;
@@ -109,23 +149,32 @@ public sealed class MeasurementProvisioningTests
                 Assert.Contains(isCommunity ? "r.energy_direction" : "mp.meter_point_number", previous);
             }
 
-            var isGenerationMeter = dashboard["title"]!.GetValue<string>().StartsWith("Zählpunkt · Erzeugung");
-            if (isGenerationMeter)
-                Assert.DoesNotContain(panels, p => p!["type"]!.GetValue<string>() == "heatmap");
-            else
+            Assert.DoesNotContain(panels, p => p!["type"]!.GetValue<string>() == "heatmap");
+            Assert.DoesNotContain(panels, p =>
             {
-                var heatmap = Assert.Single(panels, p => p!["type"]!.GetValue<string>() == "heatmap")!;
-                Assert.False(heatmap["options"]!["calculate"]!.GetValue<bool>());
-                Assert.Equal("none", heatmap["fieldConfig"]!["defaults"]!["unit"]!.GetValue<string>());
-                Assert.Equal("kwatth", heatmap["options"]!["cellValues"]!["unit"]!.GetValue<string>());
-                var sql = heatmap["targets"]![0]!["rawSql"]!.GetValue<string>();
-                Assert.Contains("Europe/Vienna", sql);
-                Assert.Contains("$__timeFilter(r.timestamp)", sql);
-                Assert.Contains("SUM(r.total_consumption)", sql);
-                Assert.Contains("r.community_id =", sql);
-                Assert.Contains("AS \"0\"", sql);
-                Assert.Contains("AS \"23\"", sql);
-            }
+                var title = p!["title"]!.GetValue<string>();
+                return title.Contains("Datenqualität", StringComparison.Ordinal) ||
+                    title.Contains("Vollständigkeit", StringComparison.Ordinal) ||
+                    title.Contains("Lastdauerlinie", StringComparison.Ordinal) ||
+                    title.Contains("Stündliche Leistung nach Tageszeit", StringComparison.Ordinal);
+            });
+            Assert.All(panels.Where(p => p!["fieldConfig"]?["defaults"]?["unit"]?.GetValue<string>() is
+                "kwatt" or "kwatth" or "percentunit"), panel =>
+                Assert.Equal(2, panel!["fieldConfig"]!["defaults"]!["decimals"]!.GetValue<int>()));
+
+            var direction = dashboard["title"]!.GetValue<string>().StartsWith("Zählpunkt · Erzeugung")
+                ? "generation" : "consumption";
+            var expectedCoverageTitle = direction == "generation" ? "EG-Anteil im Verlauf" : "EG-Deckungsgrad im Verlauf";
+            var coverage = Assert.Single(panels, p =>
+                p!["title"]!.GetValue<string>().Contains(expectedCoverageTitle, StringComparison.Ordinal))!;
+            Assert.Equal("fixed", coverage["fieldConfig"]!["defaults"]!["color"]!["mode"]!.GetValue<string>());
+            Assert.Equal("green", coverage["fieldConfig"]!["defaults"]!["color"]!["fixedColor"]!.GetValue<string>());
+
+            var peak = Assert.Single(panels, p =>
+                p!["title"]!.GetValue<string>().EndsWith(direction == "generation" ? "Spitzenleistung" : "Spitzenlast",
+                    StringComparison.Ordinal))!;
+            Assert.Equal("fixed", peak["fieldConfig"]!["defaults"]!["color"]!["mode"]!.GetValue<string>());
+            Assert.Equal("orange", peak["fieldConfig"]!["defaults"]!["color"]!["fixedColor"]!.GetValue<string>());
         }
     }
 
@@ -171,10 +220,10 @@ public sealed class MeasurementProvisioningTests
             d["title"]!.GetValue<string>().StartsWith("Zählpunkt ·"))["panels"]!.ToJsonString());
         Assert.All(dashboards.Where(d => d["title"]!.GetValue<string>().StartsWith("Energiegemeinschaft ·")),
             d => Assert.Contains(first.Schema + ".community_hourly_measurements", d["panels"]!.ToJsonString()));
-        Assert.Equal(12, dashboards.Single(d => d["title"]!.GetValue<string>().StartsWith("Zählpunkt ·"))
+        Assert.Equal(10, dashboards.Single(d => d["title"]!.GetValue<string>().StartsWith("Zählpunkt ·"))
             ["panels"]!.AsArray().Count(p => p!["type"]!.GetValue<string>() == "stat"));
         Assert.All(dashboards.Where(d => d["title"]!.GetValue<string>().StartsWith("Energiegemeinschaft ·")),
-            d => Assert.Equal(12, d["panels"]!.AsArray().Count(p => p!["type"]!.GetValue<string>() == "stat")));
+            d => Assert.Equal(10, d["panels"]!.AsArray().Count(p => p!["type"]!.GetValue<string>() == "stat")));
         Assert.DoesNotContain(first.Password, JsonSerializer.Serialize(dashboards));
         Assert.Equal(new[] { HttpMethod.Post, HttpMethod.Put, HttpMethod.Post, HttpMethod.Put, HttpMethod.Post },
             calls.Select(c => c.Method));

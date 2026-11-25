@@ -44,6 +44,7 @@ public static class EventPolicy
             throw new InvalidEventException("Invalid metering points.");
         if (customer.EnergyCommunities is { } communities &&
             (communities.Any(c => c is null || c.Id == Guid.Empty || string.IsNullOrWhiteSpace(c.Name) ||
+                c.LogoUrl is not null && !ValidLogoUrl(c.LogoUrl) ||
                 c.MeteringPoints is null ||
                 c.MeteringPoints.Any(p => p is null || p.Id == Guid.Empty ||
                     string.IsNullOrWhiteSpace(p.MeteringPointCode) || string.IsNullOrWhiteSpace(p.EnergyDirection) ||
@@ -52,6 +53,12 @@ public static class EventPolicy
              communities.Select(c => c.Id).Distinct().Count() != communities.Count))
             throw new InvalidEventException("Invalid communities.");
     }
+
+    private static bool ValidLogoUrl(string value) =>
+        value.Length <= 2048 &&
+        Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+        uri.Scheme == Uri.UriSchemeHttps && !string.IsNullOrWhiteSpace(uri.Host) &&
+        string.IsNullOrEmpty(uri.UserInfo);
 
     public static CustomerSnapshot Merge(CustomerSnapshot incoming, CustomerSnapshot? previous) =>
         incoming with

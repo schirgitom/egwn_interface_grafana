@@ -58,6 +58,32 @@ public sealed class PolicyTests
         { Customer = message.Customer with { RegistrationCode = "K-100" } }));
     }
 
+    [Theory]
+    [InlineData("http://assets.example.invalid/logo.svg")]
+    [InlineData("https://user:password@assets.example.invalid/logo.svg")]
+    [InlineData("not-a-url")]
+    public void RejectsInvalidCommunityLogoUrls(string logoUrl)
+    {
+        var message = Message();
+        var community = message.Customer.EnergyCommunities![0] with { LogoUrl = logoUrl };
+        Assert.Throws<InvalidEventException>(() => EventPolicy.Validate(message with
+        {
+            Customer = message.Customer with { EnergyCommunities = [community] }
+        }));
+    }
+
+    [Fact]
+    public void ReadsCommunityLogoUrlFromCustomerEvent()
+    {
+        const string logoUrl = "https://assets.example.invalid/community/logo.svg";
+        var json = OriginalCustomerEventJson.Replace("\"sourceId\":\"RC101900\"",
+            $"\"sourceId\":\"RC101900\",\"logoUrl\":\"{logoUrl}\"", StringComparison.Ordinal);
+
+        var parsed = EventPolicy.Parse(Encoding.UTF8.GetBytes(json));
+
+        Assert.Equal(logoUrl, parsed.Customer.EnergyCommunities![0].LogoUrl);
+    }
+
     [Fact]
     public void RabbitMqPayloadIgnoresCentralApiRegistrationCode()
     {
