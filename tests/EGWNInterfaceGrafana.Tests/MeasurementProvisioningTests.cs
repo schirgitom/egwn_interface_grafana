@@ -66,24 +66,69 @@ public sealed class MeasurementProvisioningTests
         var panels = community["panels"]!.AsArray();
         Assert.Equal(10, panels.Count(p => p!["type"]!.GetValue<string>() == "stat"));
         Assert.All(panels, p => Assert.NotEqual("text", p!["type"]!.GetValue<string>()));
+        Assert.All(panels, p => Assert.StartsWith("Gemeinschaft Gesamt - ", p!["title"]!.GetValue<string>()));
         Assert.Contains("Übersicht (gesamt)", community["title"]!.GetValue<string>());
         Assert.Contains($"{schema}.community_hourly_measurements", panels.ToJsonString());
         Assert.DoesNotContain($"{schema}.raw_measurements", panels.ToJsonString());
         Assert.Contains("r.energy_direction", panels.ToJsonString());
         Assert.DoesNotContain("mp.meter_point_number", panels.ToJsonString());
         Assert.Contains(panels, p => p!["title"]!.GetValue<string>() ==
-            "Verbrauch – Netzbezug vs. Bezug aus EG");
+            "Gemeinschaft Gesamt - Verbrauch – Netzbezug vs. Bezug aus EG");
         Assert.Contains(panels, p => p!["title"]!.GetValue<string>() ==
-            "Ø Stundenprofil – Werktag vs. Wochenende");
+            "Gemeinschaft Gesamt - Ø Stundenprofil – Werktag vs. Wochenende");
         Assert.Contains(panels, p => p!["title"]!.GetValue<string>() ==
-            "Leistung – Mittel und Maximum je Intervall");
-        Assert.Contains(panels, p => p!["title"]!.GetValue<string>() == "Top 10 Lastspitzen");
+            "Gemeinschaft Gesamt - Leistung – Mittel und Maximum je Intervall");
+        Assert.Contains(panels, p => p!["title"]!.GetValue<string>() == "Gemeinschaft Gesamt - Top 10 Lastspitzen");
         Assert.DoesNotContain(panels, p => p!["title"]!.GetValue<string>()
             .Contains("Stündliche Leistung", StringComparison.Ordinal));
         Assert.DoesNotContain(panels, p => p!["title"]!.GetValue<string>()
             .Contains("Lastdauerlinie", StringComparison.Ordinal));
         Assert.DoesNotContain(" * 4 AS", panels.ToJsonString());
         Assert.Equal(2, community["links"]!.AsArray().Count);
+    }
+
+    [Fact]
+    public void PowerAndHourlyProfilePanelsShareRowsWithoutOverlapping()
+    {
+        var customer = EventPolicy.Parse(System.Text.Encoding.UTF8.GetBytes(
+            PolicyTests.OriginalCustomerEventJson)).Customer;
+        var schema = $"grafana_customer_{customer.Id:N}";
+        var dashboards = GrafanaProvisioner.BuildDashboards(customer,
+            new TenantDataSource(schema, schema, "unit-test-password", "egwn-timescaledb", 5432, "egwndata2"));
+
+        foreach (var dashboard in dashboards)
+        {
+            var panels = dashboard["panels"]!.AsArray();
+            var power = panels.Where(p => p!["title"]!.GetValue<string>()
+                .EndsWith("Leistung – Mittel und Maximum je Intervall", StringComparison.Ordinal)).ToArray();
+            var profiles = panels.Where(p => p!["title"]!.GetValue<string>()
+                .EndsWith("Ø Stundenprofil – Werktag vs. Wochenende", StringComparison.Ordinal)).ToArray();
+            Assert.NotEmpty(power);
+            Assert.Equal(power.Length, profiles.Length);
+            foreach (var panel in power)
+            {
+                var position = panel!["gridPos"]!;
+                var profile = Assert.Single(profiles, p =>
+                    p!["gridPos"]!["y"]!.GetValue<int>() == position["y"]!.GetValue<int>());
+                Assert.Equal(0, position["x"]!.GetValue<int>());
+                Assert.Equal(12, position["w"]!.GetValue<int>());
+                Assert.Equal(12, profile!["gridPos"]!["x"]!.GetValue<int>());
+                Assert.Equal(12, profile["gridPos"]!["w"]!.GetValue<int>());
+            }
+
+            var positioned = panels.Select(p => p!["gridPos"]!).ToArray();
+            for (var i = 0; i < positioned.Length; i++)
+            for (var j = i + 1; j < positioned.Length; j++)
+            {
+                var a = positioned[i];
+                var b = positioned[j];
+                var overlap = a["x"]!.GetValue<int>() < b["x"]!.GetValue<int>() + b["w"]!.GetValue<int>()
+                    && b["x"]!.GetValue<int>() < a["x"]!.GetValue<int>() + a["w"]!.GetValue<int>()
+                    && a["y"]!.GetValue<int>() < b["y"]!.GetValue<int>() + b["h"]!.GetValue<int>()
+                    && b["y"]!.GetValue<int>() < a["y"]!.GetValue<int>() + a["h"]!.GetValue<int>();
+                Assert.False(overlap, $"Overlapping panels in {dashboard["title"]}: {i} and {j}");
+            }
+        }
     }
 
     [Fact]
@@ -100,7 +145,7 @@ public sealed class MeasurementProvisioningTests
         var communityDashboard = dashboards.Single(d =>
             d["title"]!.GetValue<string>().StartsWith("Energiegemeinschaft ·"));
         var logo = Assert.Single(communityDashboard["panels"]!.AsArray(),
-            p => p!["title"]!.GetValue<string>().StartsWith("Logo ·"));
+            p => p!["title"]!.GetValue<string>().StartsWith("Gemeinschaft Gesamt - Logo ·"));
 
         Assert.Equal("text", logo!["type"]!.GetValue<string>());
         Assert.Contains("logo_%28weiz%29.svg", logo["options"]!["content"]!.GetValue<string>());
@@ -112,8 +157,10 @@ public sealed class MeasurementProvisioningTests
         var noSourceDashboard = GrafanaProvisioner.BuildDashboards(customer).Single(d =>
             d["title"]!.GetValue<string>().StartsWith("Energiegemeinschaft ·"));
         var noSourceLogo = Assert.Single(noSourceDashboard["panels"]!.AsArray(),
-            p => p!["title"]!.GetValue<string>().StartsWith("Logo ·"));
+            p => p!["title"]!.GetValue<string>().StartsWith("Gemeinschaft Gesamt - Logo ·"));
         Assert.Equal(3, noSourceLogo!["gridPos"]!["y"]!.GetValue<int>());
+        Assert.All(noSourceDashboard["panels"]!.AsArray(),
+            p => Assert.StartsWith("Gemeinschaft Gesamt - ", p!["title"]!.GetValue<string>()));
     }
 
     [Fact]

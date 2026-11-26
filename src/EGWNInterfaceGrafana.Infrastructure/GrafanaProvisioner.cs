@@ -341,6 +341,8 @@ public sealed class GrafanaProvisioner(
                     start += 40;
                 }
             }
+            foreach (var panel in panels)
+                panel!["title"] = $"Gemeinschaft Gesamt - {panel["title"]!.GetValue<string>()}";
             result.Add(communityDashboard);
         }
         if (communities.Count == 0)
@@ -440,7 +442,7 @@ public sealed class GrafanaProvisioner(
               AT TIME ZONE 'Europe/Vienna') AS "time",
               MAX(power_kw) AS "Spitzenleistung", AVG(power_kw) AS "Ø Leistung"
             FROM intervals GROUP BY 1 ORDER BY 1
-            """, customerId, "kwatt", y + 13, 12));
+            """, customerId, "kwatt", y + 22, 0, 12));
         SetFixedColors(panels[^1]!.AsObject(),
             ("Spitzenleistung", "orange"), ("Ø Leistung", "blue"));
 
@@ -454,7 +456,7 @@ public sealed class GrafanaProvisioner(
               AVG(power_kw) FILTER (
                 WHERE EXTRACT(ISODOW FROM bucket AT TIME ZONE 'Europe/Vienna') >= 6) AS "Wochenende"
             FROM intervals GROUP BY 1 ORDER BY 1
-            """, customerId, "kwatt", y + 22, 0));
+            """, customerId, "kwatt", y + 13, 12));
         SetFixedColors(panels[^1]!.AsObject(),
             ("Werktag", "blue"), ("Wochenende", "orange"));
 
@@ -471,7 +473,7 @@ public sealed class GrafanaProvisioner(
               r.timestamp, TIMESTAMPTZ '2000-01-01') AS "time",
               SUM(r.total_consumption) AS "Aktuell"
             {scope} GROUP BY 1 ORDER BY 1
-            """, customerId, "kwatth", y + 22);
+            """, customerId, "kwatth", y + 22, 12, 12);
         var previous = comparison["targets"]![0]!.DeepClone();
         previous["refId"] = "B";
         previous["rawSql"] = $"""
